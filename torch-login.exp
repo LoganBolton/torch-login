@@ -1,0 +1,72 @@
+#!/usr/bin/expect -f
+# Connect to Torch and complete each Microsoft device-code challenge.
+set timeout -1
+set challenge_count 0
+set script_path [file normalize [info script]]
+while {[file type $script_path] eq "link"} {
+    set target [file readlink $script_path]
+    if {[file pathtype $target] eq "relative"} {
+        set script_path [file normalize [file join [file dirname $script_path] $target]]
+    } else {
+        set script_path [file normalize $target]
+    }
+}
+set script_dir [file dirname $script_path]
+set config_path [file join $script_dir config.local.tcl]
+if {![file exists $config_path]} {
+    puts stderr "Missing $config_path. Copy config.example.tcl to config.local.tcl and set your account details."
+    exit 1
+}
+source $config_path
+foreach key {torch_ssh_user torch_ssh_host torch_account_email} {
+    if {![info exists $key] || [set $key] eq ""} {
+        puts stderr "Set $key in $config_path."
+        exit 1
+    }
+}
+set encoded_email [string map [list "@" "%40" "+" "%2B"] $torch_account_email]
+spawn ssh "${torch_ssh_user}@${torch_ssh_host}" {*}$argv
+expect {
+    -re {Authenticate with PIN ([A-Z0-9]+) at (https://[^[:space:]]+) and press ENTER\.} {
+        incr challenge_count
+        if {$challenge_count > 3} {
+            puts "Torch issued too many device codes; stopping this login attempt."
+            catch {close}
+            catch {wait}
+            exit 1
+        }
+        set pin $expect_out(1,string)
+        set url $expect_out(2,string)
+        if {[string first "?" $url] >= 0} {
+            set hinted_url "${url}&login_hint=$encoded_email"
+        } else {
+            set hinted_url "${url}?login_hint=$encoded_email"
+        }
+        puts "\nSigning in as $torch_account_email. Device code: $pin"
+        catch {exec /usr/bin/printf %s $pin | /usr/bin/pbcopy}
+        if {[catch {exec /usr/bin/osascript [file join $script_dir torch-fill.applescript] $hinted_url $pin $torch_account_email} err]} {
+            puts "Could not complete the browser step automatically: $err"
+            puts "If macOS asks for Automation or Accessibility access, allow it for your terminal app and retry torch."
+            catch {close}
+            catch {wait}
+            exit 1
+        }
+        puts "Microsoft confirmed the Torch sign-in; waiting for cluster authorization."
+        after 6000
+        send -- "\r"
+        exp_continue
+    }
+    -re {\[[[:alnum:]_.-]+@[^]\r\n]+\][#$] ?} {
+        interact
+    }
+    -re {[Pp]assword: ?$} {
+        puts "Device sign-in did not complete SSH authentication."
+        catch {close}
+        catch {wait}
+        exit 1
+    }
+    eof {
+        catch wait result
+        exit [lindex $result 3]
+    }
+}
